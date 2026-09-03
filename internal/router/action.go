@@ -12,4 +12,7 @@ func Actions(e *aqi.AppConfig) {
 	app.Add("hi", func(a *ws.Context) {
 		a.Send(a.Params)
 	})
+	app.Add("bench.echo", func(a *ws.Context) {
+		a.Send(a.Params)
+	})
 }
