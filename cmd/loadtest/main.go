@@ -48,7 +48,7 @@ type response struct {
 	Code   int    `json:"code"`
 	Action string `json:"action"`
 	ID     string `json:"id"`
-	Data   string `json:"data"`
+	Msg    string `json:"msg"`
 }
 
 func (m *metrics) addLatency(d time.Duration) {
@@ -75,7 +75,7 @@ func main() {
 	flag.StringVar(&cfg.url, "url", "ws://127.0.0.1:2015/ws", "AQI websocket URL")
 	flag.IntVar(&cfg.connections, "connections", 1000, "concurrent websocket connections")
 	flag.DurationVar(&cfg.duration, "duration", 10*time.Minute, "test duration")
-	flag.DurationVar(&cfg.interval, "interval", 2*time.Second, "echo interval per connection")
+	flag.DurationVar(&cfg.interval, "interval", 2*time.Second, "request interval per connection")
 	flag.DurationVar(&cfg.churn, "churn", 0, "random reconnect interval per connection; 0 disables churn")
 	flag.Parse()
 
@@ -216,8 +216,8 @@ func runConnection(ctx context.Context, conn interface {
 			if err := json.Unmarshal(data, &reply); err != nil {
 				return fmt.Errorf("unmarshal response: %w", err)
 			}
-			if reply.Code != 0 || reply.Action != "bench.echo" || reply.ID != idValue || reply.Data != payload {
-				return fmt.Errorf("response mismatch: code=%d action=%q id=%q data=%q", reply.Code, reply.Action, reply.ID, reply.Data)
+			if reply.Code != 1001 || reply.Action != "bench.echo" || reply.ID != idValue || reply.Msg != "benchmark message" {
+				return fmt.Errorf("response mismatch: code=%d action=%q id=%q msg=%q", reply.Code, reply.Action, reply.ID, reply.Msg)
 			}
 
 			m.received.Add(1)
@@ -249,7 +249,7 @@ func printSummary(cfg config, elapsed time.Duration, m *metrics) {
 
 	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
 
-	fmt.Println("\nAQI WebSocket Baseline")
+	fmt.Println("\nAQI WebSocket i18n Hot Path")
 	fmt.Println("────────────────────────────")
 	fmt.Printf("Target           %s\n", cfg.url)
 	fmt.Printf("Connections      %d\n", cfg.connections)
