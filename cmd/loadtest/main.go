@@ -227,29 +227,42 @@ func collectProcessInfo() processInfo {
 	info := processInfo{
 		goroutines: fmt.Sprintf("%d", runtime.NumGoroutine()),
 	}
-
-	fdPath := "/dev/fd"
-	if runtime.GOOS == "linux" {
-		fdPath = "/proc/self/fd"
-	}
-	if entries, err := os.ReadDir(fdPath); err == nil {
-		info.openFDs = fmt.Sprintf("%d", len(entries))
-	}
-
 	pid := strconv.Itoa(os.Getpid())
-	var output string
+
 	switch runtime.GOOS {
 	case "darwin":
-		output = commandOutput("ps", "-o", "thcount=", "-o", "rss=", "-p", pid)
-	case "linux":
-		output = commandOutput("ps", "-o", "nlwp=", "-o", "rss=", "-p", pid)
-	}
+		if output := commandOutput("ps", "-M", "-p", pid); output != "" {
+			lines := strings.Split(output, "\n")
+			if len(lines) > 1 {
+				info.osThreads = fmt.Sprintf("%d", len(lines)-1)
+			}
+		}
+		if output := commandOutput("lsof", "-a", "-p", pid, "-Fn"); output != "" {
+			count := 0
+			for _, line := range strings.Split(output, "\n") {
+				if strings.HasPrefix(line, "f") {
+					count++
+				}
+			}
+			info.openFDs = fmt.Sprintf("%d", count)
+		}
+		if rss := commandOutput("ps", "-o", "rss=", "-p", pid); rss != "" {
+			if rssKiB, err := strconv.ParseFloat(strings.TrimSpace(rss), 64); err == nil {
+				info.rss = fmt.Sprintf("%.1f MiB", rssKiB/1024)
+			}
+		}
 
-	fields := strings.Fields(output)
-	if len(fields) >= 2 {
-		info.osThreads = fields[0]
-		if rssKiB, err := strconv.ParseFloat(fields[1], 64); err == nil {
-			info.rss = fmt.Sprintf("%.1f MiB", rssKiB/1024)
+	case "linux":
+		if output := commandOutput("ps", "-o", "nlwp=", "-p", pid); output != "" {
+			info.osThreads = strings.TrimSpace(output)
+		}
+		if entries, err := os.ReadDir("/proc/self/fd"); err == nil {
+			info.openFDs = fmt.Sprintf("%d", len(entries))
+		}
+		if rss := commandOutput("ps", "-o", "rss=", "-p", pid); rss != "" {
+			if rssKiB, err := strconv.ParseFloat(strings.TrimSpace(rss), 64); err == nil {
+				info.rss = fmt.Sprintf("%.1f MiB", rssKiB/1024)
+			}
 		}
 	}
 	return info
