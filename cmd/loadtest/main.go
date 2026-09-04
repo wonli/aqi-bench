@@ -148,7 +148,7 @@ func runClient(ctx context.Context, cfg config, id int, m *metrics) {
 		hadSuccessfulConnection = true
 		m.connected.Add(1)
 
-		err = runConnection(ctx, conn, cfg, id, m)
+		err = runConnection(ctx, conn, cfg, id, language, m)
 		m.connected.Add(-1)
 		_ = conn.Close()
 
@@ -166,7 +166,7 @@ func runClient(ctx context.Context, cfg config, id int, m *metrics) {
 func runConnection(ctx context.Context, conn interface {
 	Read([]byte) (int, error)
 	Write([]byte) (int, error)
-}, cfg config, id int, m *metrics) error {
+}, cfg config, id int, language string, m *metrics) error {
 	// Spread the first send across one full interval so thousands of freshly
 	// connected clients do not artificially fire on the same scheduler tick.
 	firstDelay := time.Duration(rand.Int64N(int64(cfg.interval)))
@@ -180,6 +180,11 @@ func runConnection(ctx context.Context, conn interface {
 		churnTimer = time.NewTimer(cfg.churn + jitter)
 		churn = churnTimer.C
 		defer churnTimer.Stop()
+	}
+
+	expectedMsg := "benchmark message"
+	if language == "en" {
+		expectedMsg = "benchmark message translated"
 	}
 
 	sequence := int64(0)
@@ -216,8 +221,8 @@ func runConnection(ctx context.Context, conn interface {
 			if err := json.Unmarshal(data, &reply); err != nil {
 				return fmt.Errorf("unmarshal response: %w", err)
 			}
-			if reply.Code != 1001 || reply.Action != "bench.echo" || reply.ID != idValue || reply.Msg != "benchmark message" {
-				return fmt.Errorf("response mismatch: code=%d action=%q id=%q msg=%q", reply.Code, reply.Action, reply.ID, reply.Msg)
+			if reply.Code != 1001 || reply.Action != "bench.echo" || reply.ID != idValue || reply.Msg != expectedMsg {
+				return fmt.Errorf("response mismatch: lang=%s code=%d action=%q id=%q msg=%q expected=%q", language, reply.Code, reply.Action, reply.ID, reply.Msg, expectedMsg)
 			}
 
 			m.received.Add(1)
