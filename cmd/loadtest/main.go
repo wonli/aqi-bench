@@ -98,7 +98,7 @@ func classifyError(err error) string {
 		return "timeout"
 	case strings.Contains(message, "connection refused"):
 		return "connection refused"
-	case strings.Contains(message, "cannot assign requested address"):
+	case strings.Contains(message, "cannot assign requested address"), strings.Contains(message, "can't assign requested address"):
 		return "address unavailable"
 	case strings.Contains(message, "too many open files"):
 		return "too many open files"
@@ -160,12 +160,13 @@ func main() {
 	for {
 		select {
 		case <-printTicker.C:
-			fmt.Printf("elapsed=%s connected=%d attempts=%d connectErr=%d runtimeErr=%d sent=%d recv=%d reconnects=%d\n",
-				time.Since(started).Round(time.Second), m.connected.Load(), m.connectAttempts.Load(), m.connectErr.Load(), m.runtimeErr.Load(), m.sent.Load(), m.received.Load(), m.reconnects.Load())
+			printLiveStatus(time.Since(started), m)
 		case <-ctx.Done():
+			clearLiveStatus()
 			printSummary(cfg, cfg.duration, m)
 			return
 		case <-done:
+			clearLiveStatus()
 			printSummary(cfg, time.Since(started), m)
 			return
 		}
@@ -202,7 +203,15 @@ func printSystemInfo() {
 			fmt.Printf("Ephemeral ports  %s\n", strings.Join(strings.Fields(ports), "-"))
 		}
 	}
-	fmt.Println()
+}
+
+func printLiveStatus(elapsed time.Duration, m *metrics) {
+	fmt.Printf("\r\033[2Kelapsed=%s connected=%d attempts=%d connectErr=%d runtimeErr=%d sent=%d recv=%d reconnects=%d",
+		elapsed.Round(time.Second), m.connected.Load(), m.connectAttempts.Load(), m.connectErr.Load(), m.runtimeErr.Load(), m.sent.Load(), m.received.Load(), m.reconnects.Load())
+}
+
+func clearLiveStatus() {
+	fmt.Print("\r\033[2K")
 }
 
 func printSystemValue(label, key string) {
@@ -356,7 +365,7 @@ func printSummary(cfg config, elapsed time.Duration, m *metrics) {
 
 	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
 
-	fmt.Println("\nAQI WebSocket i18n Hot Path")
+	fmt.Println("AQI WebSocket i18n Hot Path")
 	fmt.Println("────────────────────────────")
 	fmt.Printf("Target           %s\n", cfg.url)
 	fmt.Printf("Connections      %d\n", cfg.connections)
