@@ -9,6 +9,8 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
+	"os/exec"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -129,6 +131,8 @@ func main() {
 		return
 	}
 
+	printSystemInfo()
+
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.duration)
 	defer cancel()
 
@@ -163,6 +167,57 @@ func main() {
 			return
 		}
 	}
+}
+
+func printSystemInfo() {
+	fmt.Println("Benchmark environment")
+	fmt.Println("────────────────────────────")
+	fmt.Printf("OS / Arch        %s / %s\n", runtime.GOOS, runtime.GOARCH)
+	fmt.Printf("CPU              %d logical\n", runtime.NumCPU())
+	fmt.Printf("GOMAXPROCS       %d\n", runtime.GOMAXPROCS(0))
+
+	if soft := commandOutput("sh", "-c", "ulimit -Sn"); soft != "" {
+		fmt.Printf("NOFILE soft      %s\n", soft)
+	}
+	if hard := commandOutput("sh", "-c", "ulimit -Hn"); hard != "" {
+		fmt.Printf("NOFILE hard      %s\n", hard)
+	}
+
+	switch runtime.GOOS {
+	case "darwin":
+		printSystemValue("kern.maxfiles", "kern.maxfiles")
+		printSystemValue("maxfiles/proc", "kern.maxfilesperproc")
+		printSystemValue("somaxconn", "kern.ipc.somaxconn")
+		first := sysctlValue("net.inet.ip.portrange.first")
+		last := sysctlValue("net.inet.ip.portrange.last")
+		if first != "" && last != "" {
+			fmt.Printf("Ephemeral ports  %s-%s\n", first, last)
+		}
+	case "linux":
+		printSystemValue("somaxconn", "net.core.somaxconn")
+		if ports := sysctlValue("net.ipv4.ip_local_port_range"); ports != "" {
+			fmt.Printf("Ephemeral ports  %s\n", strings.Join(strings.Fields(ports), "-"))
+		}
+	}
+	fmt.Println()
+}
+
+func printSystemValue(label, key string) {
+	if value := sysctlValue(key); value != "" {
+		fmt.Printf("%-17s%s\n", label, value)
+	}
+}
+
+func sysctlValue(key string) string {
+	return commandOutput("sysctl", "-n", key)
+}
+
+func commandOutput(name string, args ...string) string {
+	output, err := exec.Command(name, args...).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(output))
 }
 
 func runClient(ctx context.Context, cfg config, id int, m *metrics) {
