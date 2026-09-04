@@ -21,6 +21,8 @@ import (
 	"github.com/gobwas/ws/wsutil"
 )
 
+const dashboardLines = 34
+
 type config struct {
 	url         string
 	connections int
@@ -41,6 +43,18 @@ type metrics struct {
 	mu         sync.Mutex
 	latencies  []time.Duration
 	errorKinds map[string]int64
+}
+
+type systemInfo struct {
+	osArch         string
+	cpu            string
+	gomaxprocs     string
+	nofileSoft     string
+	nofileHard     string
+	maxfiles       string
+	maxfilesProc   string
+	somaxconn      string
+	ephemeralPorts string
 }
 
 type request struct {
@@ -131,8 +145,7 @@ func main() {
 		return
 	}
 
-	printSystemInfo()
-
+	env := collectSystemInfo()
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.duration)
 	defer cancel()
 
@@ -148,7 +161,7 @@ func main() {
 		}(i)
 	}
 
-	printTicker := time.NewTicker(5 * time.Second)
+	printTicker := time.NewTicker(1 * time.Second)
 	defer printTicker.Stop()
 
 	done := make(chan struct{})
@@ -157,66 +170,149 @@ func main() {
 		close(done)
 	}()
 
+	renderDashboard(env, cfg, 0, m, false)
 	for {
 		select {
 		case <-printTicker.C:
-			printLiveStatus(time.Since(started), m)
+			renderDashboard(env, cfg, time.Since(started), m, false)
 		case <-ctx.Done():
-			clearLiveStatus()
-			printSummary(cfg, cfg.duration, m)
+			renderDashboard(env, cfg, cfg.duration, m, true)
 			return
 		case <-done:
-			clearLiveStatus()
-			printSummary(cfg, time.Since(started), m)
+			renderDashboard(env, cfg, time.Since(started), m, true)
 			return
 		}
 	}
 }
 
-func printSystemInfo() {
-	fmt.Println("Benchmark environment")
-	fmt.Println("────────────────────────────")
-	fmt.Printf("OS / Arch        %s / %s\n", runtime.GOOS, runtime.GOARCH)
-	fmt.Printf("CPU              %d logical\n", runtime.NumCPU())
-	fmt.Printf("GOMAXPROCS       %d\n", runtime.GOMAXPROCS(0))
-
-	if soft := commandOutput("sh", "-c", "ulimit -Sn"); soft != "" {
-		fmt.Printf("NOFILE soft      %s\n", soft)
-	}
-	if hard := commandOutput("sh", "-c", "ulimit -Hn"); hard != "" {
-		fmt.Printf("NOFILE hard      %s\n", hard)
+func collectSystemInfo() systemInfo {
+	info := systemInfo{
+		osArch:     fmt.Sprintf("%s / %s", runtime.GOOS, runtime.GOARCH),
+		cpu:        fmt.Sprintf("%d logical", runtime.NumCPU()),
+		gomaxprocs: fmt.Sprintf("%d", runtime.GOMAXPROCS(0)),
+		nofileSoft: commandOutput("sh", "-c", "ulimit -Sn"),
+		nofileHard: commandOutput("sh", "-c", "ulimit -Hn"),
 	}
 
 	switch runtime.GOOS {
 	case "darwin":
-		printSystemValue("kern.maxfiles", "kern.maxfiles")
-		printSystemValue("maxfiles/proc", "kern.maxfilesperproc")
-		printSystemValue("somaxconn", "kern.ipc.somaxconn")
+		info.maxfiles = sysctlValue("kern.maxfiles")
+		info.maxfilesProc = sysctlValue("kern.maxfilesperproc")
+		info.somaxconn = sysctlValue("kern.ipc.somaxconn")
 		first := sysctlValue("net.inet.ip.portrange.first")
 		last := sysctlValue("net.inet.ip.portrange.last")
 		if first != "" && last != "" {
-			fmt.Printf("Ephemeral ports  %s-%s\n", first, last)
+			info.ephemeralPorts = first + "-" + last
 		}
 	case "linux":
-		printSystemValue("somaxconn", "net.core.somaxconn")
+		info.somaxconn = sysctlValue("net.core.somaxconn")
 		if ports := sysctlValue("net.ipv4.ip_local_port_range"); ports != "" {
-			fmt.Printf("Ephemeral ports  %s\n", strings.Join(strings.Fields(ports), "-"))
+			info.ephemeralPorts = strings.Join(strings.Fields(ports), "-")
 		}
 	}
+	return info
 }
 
-func printLiveStatus(elapsed time.Duration, m *metrics) {
-	fmt.Printf("\r\033[2Kelapsed=%s connected=%d attempts=%d connectErr=%d runtimeErr=%d sent=%d recv=%d reconnects=%d",
-		elapsed.Round(time.Second), m.connected.Load(), m.connectAttempts.Load(), m.connectErr.Load(), m.runtimeErr.Load(), m.sent.Load(), m.received.Load(), m.reconnects.Load())
+func renderDashboard(env systemInfo, cfg config, elapsed time.Duration, m *metrics, final bool) {
+	if elapsed > cfg.duration {
+		elapsed = cfg.duration
+	}
+
+	m.mu.Lock()
+	errorKinds := make(map[string]int64, len(m.errorKinds))
+	for k, v := range m.errorKinds {
+		errorKinds[k] = v
+	}
+	var latencies []time.Duration
+	if final {
+		latencies = append([]time.Duration(nil), m.latencies...)
+	}
+	m.mu.Unlock()
+
+	if final {
+		sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+	}
+
+	if elapsed > 0 {
+		if final {
+			fmt.Printf("\033[%dA", dashboardLines)
+		} else if elapsed >= time.Second {
+			fmt.Printf("\033[%dA", dashboardLines)
+		}
+	}
+
+	throughput := 0.0
+	if elapsed > 0 {
+		throughput = float64(m.received.Load()) / elapsed.Seconds()
+	}
+
+	printDashboardLine("Benchmark environment")
+	printDashboardLine("────────────────────────────")
+	printMetric("OS / Arch", env.osArch)
+	printMetric("CPU", env.cpu)
+	printMetric("GOMAXPROCS", env.gomaxprocs)
+	printMetric("NOFILE soft", env.nofileSoft)
+	printMetric("NOFILE hard", env.nofileHard)
+	printMetric("kern.maxfiles", env.maxfiles)
+	printMetric("maxfiles/proc", env.maxfilesProc)
+	printMetric("somaxconn", env.somaxconn)
+	printMetric("Ephemeral ports", env.ephemeralPorts)
+	printMetric("Target", cfg.url)
+	printMetric("Connections", fmt.Sprintf("%d", cfg.connections))
+	printMetric("Duration", fmt.Sprintf("%s / %s", elapsed.Round(time.Second), cfg.duration))
+	printMetric("Connected", fmt.Sprintf("%d", m.connected.Load()))
+	printMetric("Connect attempts", fmt.Sprintf("%d", m.connectAttempts.Load()))
+	printMetric("Connect errors", fmt.Sprintf("%d", m.connectErr.Load()))
+	printMetric("Runtime errors", fmt.Sprintf("%d", m.runtimeErr.Load()))
+	printMetric("Messages sent", fmt.Sprintf("%d", m.sent.Load()))
+	printMetric("Messages recv", fmt.Sprintf("%d", m.received.Load()))
+	printMetric("Reconnects", fmt.Sprintf("%d", m.reconnects.Load()))
+	printMetric("Throughput", fmt.Sprintf("%.1f msg/s", throughput))
+	if final {
+		printMetric("RTT P50", percentile(latencies, 0.50).String())
+		printMetric("RTT P95", percentile(latencies, 0.95).String())
+		printMetric("RTT P99", percentile(latencies, 0.99).String())
+	} else {
+		printMetric("RTT P50", "measured at end")
+		printMetric("RTT P95", "measured at end")
+		printMetric("RTT P99", "measured at end")
+	}
+	printDashboardLine("")
+	printDashboardLine("Errors by type")
+	printDashboardLine("────────────────────────────")
+	printErrorRows(errorKinds, 7)
 }
 
-func clearLiveStatus() {
-	fmt.Print("\r\033[2K")
+func printDashboardLine(value string) {
+	fmt.Printf("\033[2K%s\n", value)
 }
 
-func printSystemValue(label, key string) {
-	if value := sysctlValue(key); value != "" {
-		fmt.Printf("%-17s%s\n", label, value)
+func printMetric(label, value string) {
+	fmt.Printf("\033[2K%-17s%s\n", label, value)
+}
+
+func printErrorRows(errorKinds map[string]int64, rows int) {
+	type entry struct {
+		message string
+		count   int64
+	}
+	entries := make([]entry, 0, len(errorKinds))
+	for message, count := range errorKinds {
+		entries = append(entries, entry{message: message, count: count})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].count == entries[j].count {
+			return entries[i].message < entries[j].message
+		}
+		return entries[i].count > entries[j].count
+	})
+
+	for i := 0; i < rows; i++ {
+		if i < len(entries) {
+			printDashboardLine(fmt.Sprintf("%6d  %s", entries[i].count, entries[i].message))
+		} else {
+			printDashboardLine("")
+		}
 	}
 }
 
@@ -351,69 +447,6 @@ func sleepContext(ctx context.Context, d time.Duration) bool {
 		return false
 	case <-t.C:
 		return true
-	}
-}
-
-func printSummary(cfg config, elapsed time.Duration, m *metrics) {
-	m.mu.Lock()
-	latencies := append([]time.Duration(nil), m.latencies...)
-	errorKinds := make(map[string]int64, len(m.errorKinds))
-	for k, v := range m.errorKinds {
-		errorKinds[k] = v
-	}
-	m.mu.Unlock()
-
-	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
-
-	fmt.Println("AQI WebSocket i18n Hot Path")
-	fmt.Println("────────────────────────────")
-	fmt.Printf("Target           %s\n", cfg.url)
-	fmt.Printf("Connections      %d\n", cfg.connections)
-	fmt.Printf("Duration         %s\n", elapsed.Round(time.Millisecond))
-	fmt.Printf("Connect attempts %d\n", m.connectAttempts.Load())
-	fmt.Printf("Connect errors   %d\n", m.connectErr.Load())
-	fmt.Printf("Runtime errors   %d\n", m.runtimeErr.Load())
-	fmt.Printf("Messages sent    %d\n", m.sent.Load())
-	fmt.Printf("Messages recv    %d\n", m.received.Load())
-	fmt.Printf("Reconnects       %d\n", m.reconnects.Load())
-	if elapsed > 0 {
-		fmt.Printf("Throughput       %.1f msg/s\n", float64(m.received.Load())/elapsed.Seconds())
-	}
-	fmt.Printf("RTT P50          %s\n", percentile(latencies, 0.50))
-	fmt.Printf("RTT P95          %s\n", percentile(latencies, 0.95))
-	fmt.Printf("RTT P99          %s\n", percentile(latencies, 0.99))
-
-	printErrors(errorKinds)
-}
-
-func printErrors(errorKinds map[string]int64) {
-	if len(errorKinds) == 0 {
-		return
-	}
-
-	type entry struct {
-		message string
-		count   int64
-	}
-	entries := make([]entry, 0, len(errorKinds))
-	for message, count := range errorKinds {
-		entries = append(entries, entry{message: message, count: count})
-	}
-	sort.Slice(entries, func(i, j int) bool {
-		if entries[i].count == entries[j].count {
-			return entries[i].message < entries[j].message
-		}
-		return entries[i].count > entries[j].count
-	})
-
-	fmt.Println("\nErrors by type")
-	fmt.Println("────────────────────────────")
-	limit := len(entries)
-	if limit > 10 {
-		limit = 10
-	}
-	for i := 0; i < limit; i++ {
-		fmt.Printf("%6d  %s\n", entries[i].count, entries[i].message)
 	}
 }
 
