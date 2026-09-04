@@ -9,11 +9,9 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
-	"os"
 	"os/exec"
 	"runtime"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,11 +21,12 @@ import (
 	"github.com/gobwas/ws/wsutil"
 )
 
-const dashboardLines = 39
+const dashboardLines = 40
 
 type config struct {
 	url         string
 	connections int
+	connectRate int
 	duration    time.Duration
 	interval    time.Duration
 	churn       time.Duration
@@ -64,6 +63,12 @@ type processInfo struct {
 	osThreads  string
 	openFDs    string
 	rss        string
+}
+
+type connectedClient struct {
+	id       int
+	language string
+	conn     net.Conn
 }
 
 type request struct {
@@ -144,34 +149,60 @@ func main() {
 	cfg := config{}
 	flag.StringVar(&cfg.url, "url", "ws://127.0.0.1:2015/ws", "AQI websocket URL")
 	flag.IntVar(&cfg.connections, "connections", 1000, "concurrent websocket connections")
-	flag.DurationVar(&cfg.duration, "duration", 10*time.Minute, "test duration")
+	flag.IntVar(&cfg.connectRate, "connect-rate", 500, "maximum dial attempts per second; 0 disables throttling")
+	flag.DurationVar(&cfg.duration, "duration", 10*time.Minute, "benchmark duration after all connections are established")
 	flag.DurationVar(&cfg.interval, "interval", 2*time.Second, "request interval per connection")
 	flag.DurationVar(&cfg.churn, "churn", 0, "random reconnect interval per connection; 0 disables churn")
 	flag.Parse()
 
-	if cfg.connections <= 0 || cfg.duration <= 0 || cfg.interval <= 0 || cfg.churn < 0 {
+	if cfg.connections <= 0 || cfg.connectRate < 0 || cfg.duration <= 0 || cfg.interval <= 0 || cfg.churn < 0 {
 		flag.Usage()
 		return
 	}
 
 	env := collectSystemInfo()
-	ctx, cancel := context.WithTimeout(context.Background(), cfg.duration)
-	defer cancel()
-
 	m := &metrics{}
-	started := time.Now()
+	printTicker := time.NewTicker(time.Second)
+	defer printTicker.Stop()
 
-	var wg sync.WaitGroup
+	setupCtx, cancelSetup := context.WithCancel(context.Background())
+	defer cancelSetup()
+	dialGate := newDialGate(setupCtx, cfg.connectRate)
+	ready := make(chan connectedClient, cfg.connections)
+
 	for i := 0; i < cfg.connections; i++ {
-		wg.Add(1)
 		go func(id int) {
-			defer wg.Done()
-			runClient(ctx, cfg, id, m)
+			client, ok := connectClient(setupCtx, cfg, id, m, dialGate)
+			if ok {
+				ready <- client
+			}
 		}(i)
 	}
 
-	printTicker := time.NewTicker(1 * time.Second)
-	defer printTicker.Stop()
+	clients := make([]connectedClient, 0, cfg.connections)
+	renderDashboard(env, cfg, "connecting", 0, m, false)
+	for len(clients) < cfg.connections {
+		select {
+		case client := <-ready:
+			clients = append(clients, client)
+		case <-printTicker.C:
+			renderDashboard(env, cfg, "connecting", 0, m, false)
+		}
+	}
+	cancelSetup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.duration)
+	defer cancel()
+	started := time.Now()
+
+	var wg sync.WaitGroup
+	for _, client := range clients {
+		wg.Add(1)
+		go func(client connectedClient) {
+			defer wg.Done()
+			runEstablishedClient(ctx, cfg, client, m)
+		}(client)
+	}
 
 	done := make(chan struct{})
 	go func() {
@@ -179,20 +210,93 @@ func main() {
 		close(done)
 	}()
 
-	renderDashboard(env, cfg, 0, m, false)
+	renderDashboard(env, cfg, "benchmarking", 0, m, false)
 	for {
 		select {
 		case <-printTicker.C:
-			renderDashboard(env, cfg, time.Since(started), m, false)
+			renderDashboard(env, cfg, "benchmarking", time.Since(started), m, false)
 		case <-ctx.Done():
 			<-done
-			renderDashboard(env, cfg, cfg.duration, m, true)
+			renderDashboard(env, cfg, "complete", cfg.duration, m, true)
 			return
 		case <-done:
-			renderDashboard(env, cfg, time.Since(started), m, true)
+			renderDashboard(env, cfg, "complete", time.Since(started), m, true)
 			return
 		}
 	}
+}
+
+func newDialGate(ctx context.Context, rate int) <-chan struct{} {
+	if rate <= 0 {
+		return nil
+	}
+
+	interval := time.Second / time.Duration(rate)
+	if interval <= 0 {
+		interval = time.Nanosecond
+	}
+
+	gate := make(chan struct{}, 1)
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		defer close(gate)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				select {
+				case gate <- struct{}{}:
+				default:
+				}
+			}
+		}
+	}()
+	return gate
+}
+
+func waitDialGate(ctx context.Context, gate <-chan struct{}) bool {
+	if gate == nil {
+		return ctx.Err() == nil
+	}
+	select {
+	case <-ctx.Done():
+		return false
+	case _, ok := <-gate:
+		return ok
+	}
+}
+
+func connectClient(ctx context.Context, cfg config, id int, m *metrics, gate <-chan struct{}) (connectedClient, bool) {
+	languages := [...]string{"zh", "en", "ja"}
+	language := languages[rand.IntN(len(languages))]
+	header := http.Header{}
+	header.Set("User-Agent", "aqi-bench-loadtest")
+	url := fmt.Sprintf("%s?platform=bench&appId=bench-%d&clientId=client-%d&lang=%s", cfg.url, id, id, language)
+
+	for ctx.Err() == nil {
+		if !waitDialGate(ctx, gate) {
+			return connectedClient{}, false
+		}
+		m.connectAttempts.Add(1)
+
+		dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		conn, _, _, err := gws.Dialer{Header: gws.HandshakeHeaderHTTP(header)}.Dial(dialCtx, url)
+		cancel()
+		if err != nil {
+			if ctx.Err() != nil {
+				return connectedClient{}, false
+			}
+			m.connectErr.Add(1)
+			m.addError("connect", err)
+			continue
+		}
+
+		m.connected.Add(1)
+		return connectedClient{id: id, language: language, conn: conn}, true
+	}
+	return connectedClient{}, false
 }
 
 func collectSystemInfo() systemInfo {
@@ -224,11 +328,6 @@ func collectSystemInfo() systemInfo {
 }
 
 func collectProcessInfo() processInfo {
-	// Keep live benchmark sampling inside the Go runtime. Forking ps/lsof
-	// every second can itself create scheduler and process pressure on older
-	// macOS versions when tens of thousands of sockets are active.
-	_ = os.Getpid()
-	_ = strconv.IntSize
 	return processInfo{
 		goroutines: fmt.Sprintf("%d", runtime.NumGoroutine()),
 		osThreads:  "external only",
@@ -237,13 +336,12 @@ func collectProcessInfo() processInfo {
 	}
 }
 
-func renderDashboard(env systemInfo, cfg config, elapsed time.Duration, m *metrics, final bool) {
+func renderDashboard(env systemInfo, cfg config, phase string, elapsed time.Duration, m *metrics, final bool) {
 	if elapsed > cfg.duration {
 		elapsed = cfg.duration
 	}
 
 	process := collectProcessInfo()
-
 	m.mu.Lock()
 	errorKinds := make(map[string]int64, len(m.errorKinds))
 	for k, v := range m.errorKinds {
@@ -259,12 +357,8 @@ func renderDashboard(env systemInfo, cfg config, elapsed time.Duration, m *metri
 		sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
 	}
 
-	if elapsed > 0 {
-		if final {
-			fmt.Printf("\033[%dA", dashboardLines)
-		} else if elapsed >= time.Second {
-			fmt.Printf("\033[%dA", dashboardLines)
-		}
+	if phase != "connecting" || m.connected.Load() > 0 {
+		fmt.Printf("\033[%dA", dashboardLines)
 	}
 
 	throughput := 0.0
@@ -287,9 +381,15 @@ func renderDashboard(env systemInfo, cfg config, elapsed time.Duration, m *metri
 	printMetric("OS threads", process.osThreads)
 	printMetric("Open FDs", process.openFDs)
 	printMetric("RSS", process.rss)
+	printMetric("Phase", phase)
 	printMetric("Target", cfg.url)
 	printMetric("Connections", fmt.Sprintf("%d", cfg.connections))
-	printMetric("Duration", fmt.Sprintf("%s / %s", elapsed.Round(time.Second), cfg.duration))
+	printMetric("Connect rate", connectRateLabel(cfg.connectRate))
+	if phase == "connecting" {
+		printMetric("Duration", fmt.Sprintf("waiting / %s", cfg.duration))
+	} else {
+		printMetric("Duration", fmt.Sprintf("%s / %s", elapsed.Round(time.Second), cfg.duration))
+	}
 	printMetric("Connected", fmt.Sprintf("%d", m.connected.Load()))
 	printMetric("Connect attempts", fmt.Sprintf("%d", m.connectAttempts.Load()))
 	printMetric("Connect errors", fmt.Sprintf("%d", m.connectErr.Load()))
@@ -311,6 +411,13 @@ func renderDashboard(env systemInfo, cfg config, elapsed time.Duration, m *metri
 	printDashboardLine("Errors by type")
 	printDashboardLine("────────────────────────────")
 	printErrorRows(errorKinds, 7)
+}
+
+func connectRateLabel(rate int) string {
+	if rate <= 0 {
+		return "unlimited"
+	}
+	return fmt.Sprintf("%d/s", rate)
 }
 
 func printDashboardLine(value string) {
@@ -358,50 +465,29 @@ func commandOutput(name string, args ...string) string {
 	return strings.TrimSpace(string(output))
 }
 
-func runClient(ctx context.Context, cfg config, id int, m *metrics) {
-	hadSuccessfulConnection := false
-	for ctx.Err() == nil {
-		m.connectAttempts.Add(1)
-
-		header := http.Header{}
-		header.Set("User-Agent", "aqi-bench-loadtest")
-		languages := [...]string{"zh", "en", "ja"}
-		language := languages[rand.IntN(len(languages))]
-		url := fmt.Sprintf("%s?platform=bench&appId=bench-%d&clientId=client-%d&lang=%s", cfg.url, id, id, language)
-		conn, _, _, err := gws.Dialer{Header: gws.HandshakeHeaderHTTP(header)}.Dial(ctx, url)
-		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			m.connectErr.Add(1)
-			m.addError("connect", err)
-			if !sleepContext(ctx, 250*time.Millisecond) {
-				return
-			}
-			continue
-		}
-
-		if hadSuccessfulConnection {
-			m.reconnects.Add(1)
-		}
-		hadSuccessfulConnection = true
-		m.connected.Add(1)
-
+func runEstablishedClient(ctx context.Context, cfg config, client connectedClient, m *metrics) {
+	for {
 		if deadline, ok := ctx.Deadline(); ok {
-			_ = conn.SetDeadline(deadline)
+			_ = client.conn.SetDeadline(deadline)
 		}
-		err = runConnection(ctx, conn, cfg, id, language, m)
+		err := runConnection(ctx, client.conn, cfg, client.id, client.language, m)
 		m.connected.Add(-1)
-		_ = conn.Close()
+		_ = client.conn.Close()
 
 		if err != nil && ctx.Err() == nil {
 			m.runtimeErr.Add(1)
 			m.addError("runtime", err)
 		}
-
 		if cfg.churn == 0 || ctx.Err() != nil {
 			return
 		}
+
+		m.reconnects.Add(1)
+		next, ok := connectClient(ctx, cfg, client.id, m, nil)
+		if !ok {
+			return
+		}
+		client = next
 	}
 }
 
@@ -472,17 +558,6 @@ func runConnection(ctx context.Context, conn interface {
 			m.addLatency(time.Since(started))
 			sendTimer.Reset(cfg.interval)
 		}
-	}
-}
-
-func sleepContext(ctx context.Context, d time.Duration) bool {
-	t := time.NewTimer(d)
-	defer t.Stop()
-	select {
-	case <-ctx.Done():
-		return false
-	case <-t.C:
-		return true
 	}
 }
 
