@@ -127,10 +127,8 @@ func runClient(ctx context.Context, cfg config, id int, m *metrics) {
 
 		header := http.Header{}
 		header.Set("User-Agent", "aqi-bench-loadtest")
-		language := "zh"
-		if rand.IntN(2) == 0 {
-			language = "en"
-		}
+		languages := [...]string{"zh", "en", "ja"}
+		language := languages[rand.IntN(len(languages))]
 		url := fmt.Sprintf("%s?platform=bench&appId=bench-%d&clientId=client-%d&lang=%s", cfg.url, id, id, language)
 		conn, _, _, err := gws.Dialer{Header: gws.HandshakeHeaderHTTP(header)}.Dial(ctx, url)
 		if err != nil {
@@ -182,10 +180,11 @@ func runConnection(ctx context.Context, conn interface {
 		defer churnTimer.Stop()
 	}
 
-	expectedMsg := "benchmark message"
-	if language == "en" {
-		expectedMsg = "benchmark message translated"
-	}
+	expectedMsg := map[string]string{
+		"zh": "benchmark message",
+		"en": "benchmark message translated",
+		"ja": "ベンチマークメッセージ",
+	}[language]
 
 	sequence := int64(0)
 	for {
