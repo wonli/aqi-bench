@@ -9,9 +9,11 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
+	"os"
 	"os/exec"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,7 +23,7 @@ import (
 	"github.com/gobwas/ws/wsutil"
 )
 
-const dashboardLines = 35
+const dashboardLines = 39
 
 type config struct {
 	url         string
@@ -55,6 +57,13 @@ type systemInfo struct {
 	maxfilesProc   string
 	somaxconn      string
 	ephemeralPorts string
+}
+
+type processInfo struct {
+	goroutines string
+	osThreads  string
+	openFDs    string
+	rss        string
 }
 
 type request struct {
@@ -214,10 +223,44 @@ func collectSystemInfo() systemInfo {
 	return info
 }
 
+func collectProcessInfo() processInfo {
+	info := processInfo{
+		goroutines: fmt.Sprintf("%d", runtime.NumGoroutine()),
+	}
+
+	fdPath := "/dev/fd"
+	if runtime.GOOS == "linux" {
+		fdPath = "/proc/self/fd"
+	}
+	if entries, err := os.ReadDir(fdPath); err == nil {
+		info.openFDs = fmt.Sprintf("%d", len(entries))
+	}
+
+	pid := strconv.Itoa(os.Getpid())
+	var output string
+	switch runtime.GOOS {
+	case "darwin":
+		output = commandOutput("ps", "-o", "thcount=", "-o", "rss=", "-p", pid)
+	case "linux":
+		output = commandOutput("ps", "-o", "nlwp=", "-o", "rss=", "-p", pid)
+	}
+
+	fields := strings.Fields(output)
+	if len(fields) >= 2 {
+		info.osThreads = fields[0]
+		if rssKiB, err := strconv.ParseFloat(fields[1], 64); err == nil {
+			info.rss = fmt.Sprintf("%.1f MiB", rssKiB/1024)
+		}
+	}
+	return info
+}
+
 func renderDashboard(env systemInfo, cfg config, elapsed time.Duration, m *metrics, final bool) {
 	if elapsed > cfg.duration {
 		elapsed = cfg.duration
 	}
+
+	process := collectProcessInfo()
 
 	m.mu.Lock()
 	errorKinds := make(map[string]int64, len(m.errorKinds))
@@ -258,6 +301,10 @@ func renderDashboard(env systemInfo, cfg config, elapsed time.Duration, m *metri
 	printMetric("maxfiles/proc", env.maxfilesProc)
 	printMetric("somaxconn", env.somaxconn)
 	printMetric("Ephemeral ports", env.ephemeralPorts)
+	printMetric("Goroutines", process.goroutines)
+	printMetric("OS threads", process.osThreads)
+	printMetric("Open FDs", process.openFDs)
+	printMetric("RSS", process.rss)
 	printMetric("Target", cfg.url)
 	printMetric("Connections", fmt.Sprintf("%d", cfg.connections))
 	printMetric("Duration", fmt.Sprintf("%s / %s", elapsed.Round(time.Second), cfg.duration))
