@@ -5,9 +5,12 @@ import (
 	"encoding/json/v2"
 	"flag"
 	"fmt"
+	"io"
 	"math/rand/v2"
+	"net"
 	"net/http"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -61,13 +64,55 @@ func (m *metrics) addError(kind string, err error) {
 	if err == nil {
 		return
 	}
-	key := kind + ": " + err.Error()
+	key := kind + ": " + classifyError(err)
 	m.mu.Lock()
 	if m.errorKinds == nil {
 		m.errorKinds = make(map[string]int64)
 	}
 	m.errorKinds[key]++
 	m.mu.Unlock()
+}
+
+func classifyError(err error) string {
+	if err == nil {
+		return "unknown"
+	}
+	if err == context.Canceled {
+		return "canceled"
+	}
+	if err == context.DeadlineExceeded {
+		return "timeout"
+	}
+	if err == io.EOF {
+		return "EOF"
+	}
+	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		return "timeout"
+	}
+
+	message := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(message, "timeout"), strings.Contains(message, "deadline exceeded"):
+		return "timeout"
+	case strings.Contains(message, "connection refused"):
+		return "connection refused"
+	case strings.Contains(message, "cannot assign requested address"):
+		return "address unavailable"
+	case strings.Contains(message, "too many open files"):
+		return "too many open files"
+	case strings.Contains(message, "no buffer space available"):
+		return "no buffer space"
+	case strings.Contains(message, "connection reset"):
+		return "connection reset"
+	case strings.Contains(message, "broken pipe"):
+		return "broken pipe"
+	case strings.Contains(message, "unexpected eof"):
+		return "unexpected EOF"
+	case strings.Contains(message, "eof"):
+		return "EOF"
+	default:
+		return err.Error()
+	}
 }
 
 func main() {
