@@ -13,6 +13,6 @@ func Actions(e *aqi.AppConfig) {
 		a.Send(a.Params)
 	})
 	app.Add("bench.echo", func(a *ws.Context) {
-		a.Send(a.Params)
+		a.SendCode(1001, "benchmark message")
 	})
 }
