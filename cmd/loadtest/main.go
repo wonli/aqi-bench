@@ -224,48 +224,17 @@ func collectSystemInfo() systemInfo {
 }
 
 func collectProcessInfo() processInfo {
-	info := processInfo{
+	// Keep live benchmark sampling inside the Go runtime. Forking ps/lsof
+	// every second can itself create scheduler and process pressure on older
+	// macOS versions when tens of thousands of sockets are active.
+	_ = os.Getpid()
+	_ = strconv.IntSize
+	return processInfo{
 		goroutines: fmt.Sprintf("%d", runtime.NumGoroutine()),
+		osThreads:  "external only",
+		openFDs:    "external only",
+		rss:        "external only",
 	}
-	pid := strconv.Itoa(os.Getpid())
-
-	switch runtime.GOOS {
-	case "darwin":
-		if output := commandOutput("ps", "-M", "-p", pid); output != "" {
-			lines := strings.Split(output, "\n")
-			if len(lines) > 1 {
-				info.osThreads = fmt.Sprintf("%d", len(lines)-1)
-			}
-		}
-		if output := commandOutput("lsof", "-a", "-p", pid, "-Fn"); output != "" {
-			count := 0
-			for _, line := range strings.Split(output, "\n") {
-				if strings.HasPrefix(line, "f") {
-					count++
-				}
-			}
-			info.openFDs = fmt.Sprintf("%d", count)
-		}
-		if rss := commandOutput("ps", "-o", "rss=", "-p", pid); rss != "" {
-			if rssKiB, err := strconv.ParseFloat(strings.TrimSpace(rss), 64); err == nil {
-				info.rss = fmt.Sprintf("%.1f MiB", rssKiB/1024)
-			}
-		}
-
-	case "linux":
-		if output := commandOutput("ps", "-o", "nlwp=", "-p", pid); output != "" {
-			info.osThreads = strings.TrimSpace(output)
-		}
-		if entries, err := os.ReadDir("/proc/self/fd"); err == nil {
-			info.openFDs = fmt.Sprintf("%d", len(entries))
-		}
-		if rss := commandOutput("ps", "-o", "rss=", "-p", pid); rss != "" {
-			if rssKiB, err := strconv.ParseFloat(strings.TrimSpace(rss), 64); err == nil {
-				info.rss = fmt.Sprintf("%.1f MiB", rssKiB/1024)
-			}
-		}
-	}
-	return info
 }
 
 func renderDashboard(env systemInfo, cfg config, elapsed time.Duration, m *metrics, final bool) {
