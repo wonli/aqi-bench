@@ -21,7 +21,7 @@ import (
 	"github.com/gobwas/ws/wsutil"
 )
 
-const dashboardLines = 34
+const dashboardLines = 35
 
 type config struct {
 	url         string
