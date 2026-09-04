@@ -418,11 +418,10 @@ func runClient(ctx context.Context, cfg config, id int, m *metrics) {
 		hadSuccessfulConnection = true
 		m.connected.Add(1)
 
-		stopClose := context.AfterFunc(ctx, func() {
-			_ = conn.Close()
-		})
+		if deadline, ok := ctx.Deadline(); ok {
+			_ = conn.SetDeadline(deadline)
+		}
 		err = runConnection(ctx, conn, cfg, id, language, m)
-		stopClose()
 		m.connected.Add(-1)
 		_ = conn.Close()
 
