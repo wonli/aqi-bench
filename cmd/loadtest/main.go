@@ -127,7 +127,11 @@ func runClient(ctx context.Context, cfg config, id int, m *metrics) {
 
 		header := http.Header{}
 		header.Set("User-Agent", "aqi-bench-loadtest")
-		url := fmt.Sprintf("%s?platform=bench&appId=bench-%d&clientId=client-%d", cfg.url, id, id)
+		language := "zh"
+		if rand.IntN(2) == 0 {
+			language = "en"
+		}
+		url := fmt.Sprintf("%s?platform=bench&appId=bench-%d&clientId=client-%d&lang=%s", cfg.url, id, id, language)
 		conn, _, _, err := gws.Dialer{Header: gws.HandshakeHeaderHTTP(header)}.Dial(ctx, url)
 		if err != nil {
 			m.connectErr.Add(1)
