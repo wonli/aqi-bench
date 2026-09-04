@@ -162,6 +162,9 @@ func main() {
 		case <-printTicker.C:
 			fmt.Printf("elapsed=%s connected=%d attempts=%d connectErr=%d runtimeErr=%d sent=%d recv=%d reconnects=%d\n",
 				time.Since(started).Round(time.Second), m.connected.Load(), m.connectAttempts.Load(), m.connectErr.Load(), m.runtimeErr.Load(), m.sent.Load(), m.received.Load(), m.reconnects.Load())
+		case <-ctx.Done():
+			printSummary(cfg, cfg.duration, m)
+			return
 		case <-done:
 			printSummary(cfg, time.Since(started), m)
 			return
