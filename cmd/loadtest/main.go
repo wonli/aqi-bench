@@ -176,6 +176,7 @@ func main() {
 		case <-printTicker.C:
 			renderDashboard(env, cfg, time.Since(started), m, false)
 		case <-ctx.Done():
+			<-done
 			renderDashboard(env, cfg, cfg.duration, m, true)
 			return
 		case <-done:
@@ -246,7 +247,7 @@ func renderDashboard(env systemInfo, cfg config, elapsed time.Duration, m *metri
 		throughput = float64(m.received.Load()) / elapsed.Seconds()
 	}
 
-	printDashboardLine("Benchmark environment")
+	printDashboardLine("AQI WebSocket Benchmark")
 	printDashboardLine("────────────────────────────")
 	printMetric("OS / Arch", env.osArch)
 	printMetric("CPU", env.cpu)
@@ -340,6 +341,9 @@ func runClient(ctx context.Context, cfg config, id int, m *metrics) {
 		url := fmt.Sprintf("%s?platform=bench&appId=bench-%d&clientId=client-%d&lang=%s", cfg.url, id, id, language)
 		conn, _, _, err := gws.Dialer{Header: gws.HandshakeHeaderHTTP(header)}.Dial(ctx, url)
 		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
 			m.connectErr.Add(1)
 			m.addError("connect", err)
 			if !sleepContext(ctx, 250*time.Millisecond) {
@@ -354,7 +358,11 @@ func runClient(ctx context.Context, cfg config, id int, m *metrics) {
 		hadSuccessfulConnection = true
 		m.connected.Add(1)
 
+		stopClose := context.AfterFunc(ctx, func() {
+			_ = conn.Close()
+		})
 		err = runConnection(ctx, conn, cfg, id, language, m)
+		stopClose()
 		m.connected.Add(-1)
 		_ = conn.Close()
 
