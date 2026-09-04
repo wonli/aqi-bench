@@ -466,19 +466,18 @@ func commandOutput(name string, args ...string) string {
 }
 
 func runEstablishedClient(ctx context.Context, cfg config, client connectedClient, m *metrics) {
+	benchmarkDeadline, _ := ctx.Deadline()
 	for {
-		if deadline, ok := ctx.Deadline(); ok {
-			_ = client.conn.SetDeadline(deadline)
-		}
+		_ = client.conn.SetDeadline(benchmarkDeadline)
 		err := runConnection(ctx, client.conn, cfg, client.id, client.language, m)
 		m.connected.Add(-1)
 		_ = client.conn.Close()
 
-		if err != nil && ctx.Err() == nil {
+		if err != nil && !benchmarkEnded(ctx, benchmarkDeadline) {
 			m.runtimeErr.Add(1)
 			m.addError("runtime", err)
 		}
-		if cfg.churn == 0 || ctx.Err() != nil {
+		if cfg.churn == 0 || benchmarkEnded(ctx, benchmarkDeadline) {
 			return
 		}
 
@@ -489,6 +488,10 @@ func runEstablishedClient(ctx context.Context, cfg config, client connectedClien
 		}
 		client = next
 	}
+}
+
+func benchmarkEnded(ctx context.Context, deadline time.Time) bool {
+	return ctx.Err() != nil || (!deadline.IsZero() && !time.Now().Before(deadline))
 }
 
 func runConnection(ctx context.Context, conn interface {
