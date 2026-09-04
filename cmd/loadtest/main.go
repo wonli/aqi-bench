@@ -21,7 +21,7 @@ import (
 	"github.com/gobwas/ws/wsutil"
 )
 
-const dashboardLines = 40
+const dashboardLines = 43
 
 type config struct {
 	url         string
@@ -43,6 +43,7 @@ type metrics struct {
 
 	mu         sync.Mutex
 	latencies  []time.Duration
+	schedulerLag []time.Duration
 	errorKinds map[string]int64
 }
 
@@ -87,6 +88,12 @@ type response struct {
 func (m *metrics) addLatency(d time.Duration) {
 	m.mu.Lock()
 	m.latencies = append(m.latencies, d)
+	m.mu.Unlock()
+}
+
+func (m *metrics) addSchedulerLag(d time.Duration) {
+	m.mu.Lock()
+	m.schedulerLag = append(m.schedulerLag, d)
 	m.mu.Unlock()
 }
 
@@ -194,6 +201,7 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.duration)
 	defer cancel()
 	started := time.Now()
+	go measureSchedulerLag(ctx, m, 10*time.Millisecond)
 
 	var wg sync.WaitGroup
 	for _, client := range clients {
@@ -222,6 +230,31 @@ func main() {
 		case <-done:
 			renderDashboard(env, cfg, "complete", time.Since(started), m, true)
 			return
+		}
+	}
+}
+
+func measureSchedulerLag(ctx context.Context, m *metrics, interval time.Duration) {
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	expected := time.Now().Add(interval)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-timer.C:
+			lag := now.Sub(expected)
+			if lag < 0 {
+				lag = 0
+			}
+			m.addSchedulerLag(lag)
+			expected = expected.Add(interval)
+			delay := time.Until(expected)
+			if delay < 0 {
+				delay = 0
+			}
+			timer.Reset(delay)
 		}
 	}
 }
@@ -348,13 +381,16 @@ func renderDashboard(env systemInfo, cfg config, phase string, elapsed time.Dura
 		errorKinds[k] = v
 	}
 	var latencies []time.Duration
+	var schedulerLag []time.Duration
 	if final {
 		latencies = append([]time.Duration(nil), m.latencies...)
+		schedulerLag = append([]time.Duration(nil), m.schedulerLag...)
 	}
 	m.mu.Unlock()
 
 	if final {
 		sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+		sort.Slice(schedulerLag, func(i, j int) bool { return schedulerLag[i] < schedulerLag[j] })
 	}
 
 	if phase != "connecting" || m.connected.Load() > 0 {
@@ -402,10 +438,16 @@ func renderDashboard(env systemInfo, cfg config, phase string, elapsed time.Dura
 		printMetric("RTT P50", percentile(latencies, 0.50).String())
 		printMetric("RTT P95", percentile(latencies, 0.95).String())
 		printMetric("RTT P99", percentile(latencies, 0.99).String())
+		printMetric("Loadgen lag P50", percentile(schedulerLag, 0.50).String())
+		printMetric("Loadgen lag P95", percentile(schedulerLag, 0.95).String())
+		printMetric("Loadgen lag P99", percentile(schedulerLag, 0.99).String())
 	} else {
 		printMetric("RTT P50", "measured at end")
 		printMetric("RTT P95", "measured at end")
 		printMetric("RTT P99", "measured at end")
+		printMetric("Loadgen lag P50", "measured at end")
+		printMetric("Loadgen lag P95", "measured at end")
+		printMetric("Loadgen lag P99", "measured at end")
 	}
 	printDashboardLine("")
 	printDashboardLine("Errors by type")
